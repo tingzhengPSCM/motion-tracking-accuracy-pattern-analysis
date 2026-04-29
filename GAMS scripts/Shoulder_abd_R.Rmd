@@ -1,0 +1,646 @@
+---
+title: "Shoulder abduction_R_frontal"
+author: "TZ"
+date: "2026-04-18"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+set.seed(42)
+```
+
+
+# 0. Preparation
+## loadPackages, message=FALSE, echo=FALSE
+```{r}
+library(lme4)
+library(mgcv)
+library(itsadug)
+library(gratia)
+library(ggplot2)
+library(ggeffects)
+library(readxl)
+library(wesanderson)
+library(dplyr)
+library(tidyr)
+library(emmeans)
+library(nlme)
+library(car)
+library(patchwork)
+```
+
+# GAM-CPU distribution - use half of the available cores
+```{r}
+n.cores <- max(1, parallel::detectCores() %/% 2, na.rm = T)
+```
+
+
+# Read data
+```{r}
+df <- read_excel("D:/next.Hessenbox/Human-technology interaction/Motion tracking accuracy comparison/Data_Zenodo/Shoulder_abd_R.xlsx")
+head (df)
+```
+
+
+# 1. Calculate MAE and RMSE
+```{r}
+mae  <- function(x, y, na.rm = TRUE) mean(abs(x - y), na.rm = na.rm)
+rmse <- function(x, y, na.rm = TRUE) sqrt(mean((x - y)^2, na.rm = na.rm))
+
+long_err <- df %>%
+  pivot_longer(c(Kinect, Captiv), names_to = "device", values_to = "angle") %>%
+  mutate(
+    abs_err = abs(angle - Angle_scale),
+    sq_err  = (angle - Angle_scale)^2
+  )
+
+summarizer <- function(.data, ...) {
+  grp <- quos(...)
+  .data %>%
+    { if (length(grp) > 0) group_by(., !!!grp, device) else group_by(., device) } %>%
+    summarise(
+      n    = n(),
+      MAE  = mean(abs_err, na.rm = TRUE),
+      RMSE = sqrt(mean(sq_err, na.rm = TRUE)),
+      .groups = "drop_last"
+    ) %>%
+    pivot_wider(
+      names_from = device,
+      values_from = c(MAE, RMSE, n),
+      names_sep = "_"
+    ) %>%
+    mutate(
+      dMAE  = MAE_Captiv  - MAE_Kinect,
+      dRMSE = RMSE_Captiv - RMSE_Kinect
+    ) %>%
+    { if (length(grp) > 0) arrange(., !!!grp) else . }
+}
+
+overall_tbl <- summarizer(long_err) %>% mutate(level = "overall", .before = 1)
+by_part_tbl <- summarizer(long_err, Participant) %>% mutate(level = "by_participant", .before = 1)
+by_pt_tbl   <- summarizer(long_err, Participant, Trial) %>% mutate(level = "by_participant_trial", .before = 1)
+
+comparison_all_levels <- bind_rows(overall_tbl, by_part_tbl, by_pt_tbl)
+comparison_all_levels
+```
+
+
+
+# 2. GAM unfactored approach 
+## 2.1 Reorganize dataset
+```{r}
+df <- df %>%
+  mutate(Kinect_error = Kinect - Angle_scale,
+         Captiv_error = Captiv - Angle_scale)
+
+# Reshape
+df_long <- df %>%
+  pivot_longer(cols = c(Kinect_error, Captiv_error),
+               names_to = "Device", 
+               values_to = "Error")
+
+head(df_long)
+```
+
+
+## 2.2 Factorize categorical variables
+```{r}
+df_long$Participant <- factor(df_long$Participant, ordered=F)
+df_long$Trial <- factor(df_long$Trial, ordered=F)
+df_long$Device <- factor(df_long$Device, levels = c("Kinect_error", "Captiv_error"), ordered=F)
+str(df_long)
+```
+
+
+## 2.3a Create Trial ID as a new variable that integrates trial and participant
+```{r}
+df_long <- df_long %>%
+  mutate(TrialID = interaction(Participant, Trial, drop = TRUE))
+df_long$TrialID <- factor(df_long$TrialID, ordered=F)
+str(df_long)
+```
+
+## 2.3b Create SeriesID and time index for autocorrelation diagnostics
+```{r}
+df_long <- df_long %>%
+  mutate(
+    SeriesID = interaction(Participant, Trial, Device, drop = TRUE)
+  ) %>%
+  arrange(SeriesID, Frame) %>%
+  group_by(SeriesID) %>%
+  mutate(
+    t = row_number()
+  ) %>%
+  ungroup()
+
+str(df_long)
+```
+
+
+## 2.3c Helper functions for diagnostics
+```{r}
+acf1 <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3) return(NA_real_)
+  acf(x, plot = FALSE, na.action = na.pass)$acf[2]
+}
+
+plot_qq <- function(diag_df, title = "QQ plot") {
+  ggplot(diag_df, aes(sample = resid)) +
+    stat_qq(alpha = 0.4) +
+    stat_qq_line() +
+    theme_bw() +
+    labs(title = title, x = "Theoretical quantiles", y = "Sample quantiles")
+}
+
+plot_resid_fitted <- function(diag_df, title = "Residuals vs fitted") {
+  ggplot(diag_df, aes(x = fitted, y = resid)) +
+    geom_point(alpha = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_smooth(method = "loess", se = TRUE) +
+    theme_bw() +
+    labs(title = title, x = "Fitted values", y = "Residuals")
+}
+
+plot_scale_location <- function(diag_df, title = "Scale-location plot") {
+  ggplot(diag_df, aes(x = fitted, y = sqrt(abs(resid)))) +
+    geom_point(alpha = 0.3) +
+    geom_smooth(method = "loess", se = TRUE) +
+    theme_bw() +
+    labs(title = title, x = "Fitted values", y = "sqrt(|Residuals|)")
+}
+
+plot_lag1_acf_hist <- function(diag_df, title = "Lag-1 residual ACF") {
+  rho_df <- diag_df %>%
+    group_by(SeriesID) %>%
+    summarise(rho1 = acf1(resid), .groups = "drop")
+
+  p <- ggplot(rho_df, aes(x = rho1)) +
+    geom_histogram(binwidth = 0.05) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    theme_bw() +
+    labs(title = title, x = "Lag-1 residual ACF", y = "Count")
+
+  list(plot = p, rho_df = rho_df)
+}
+
+# VIF only for parametric part
+get_parametric_vif <- function(model, data) {
+  tt <- delete.response(terms(model$pterms))
+  X <- model.matrix(tt, data = data)
+
+  # remove intercept
+  if ("(Intercept)" %in% colnames(X)) {
+    X <- X[, colnames(X) != "(Intercept)", drop = FALSE]
+  }
+
+  if (ncol(X) < 2) {
+    return(data.frame(term = colnames(X), VIF = NA_real_))
+  }
+
+  vif_vals <- car::vif(lm(X[, 1] ~ X[, -1, drop = FALSE]))
+  data.frame(term = names(vif_vals), VIF = as.numeric(vif_vals))
+}
+
+extract_concurvity <- function(model, model_name) {
+  cc <- concurvity(model, full = TRUE)
+  out <- as.data.frame(cc)
+  out$term <- rownames(out)
+  rownames(out) <- NULL
+  out$model <- model_name
+  out %>%
+    select(model, term, worst, observed, estimate)
+}
+```
+
+
+## 2.4 GAM model using unordered factor approach
+```{r}
+m.tid <- gam(Error 
+         ~ 1                              # Parametric intercept
+         + Device                         # Parametric main effect of Group
+         + s(Angle_scale, by=Device)      # Smooth for angle scale (separately for each Device)
+         + s(Participant, bs="re")        # By-participant random intercepts
+         + s(TrialID, bs="re"),           # By-trial random intercepts
+         data = df_long,
+         method = "REML",
+)
+```
+
+
+## 2.5 Prediction using unordered factor approach
+```{r}
+ggemmeans(m.tid, c("Angle_scale [all]", "Device")) |>
+  plot() +
+  scale_color_manual(values = c("Kinect_error" = "red", "Captiv_error" = "blue")) +
+  scale_fill_manual(values = c("Kinect_error" = "red", "Captiv_error" = "blue"))
+```
+
+
+## 2.6 Model summary
+```{r}
+## ----gam-both-sum-par---------------------------
+summary(m.tid)$p.table
+
+
+## ----gam-both-sum-smo---------------------------
+summary(m.tid)$s.table
+```
+
+
+## 2.7 k check
+```{r}
+k.check(m.tid, n.rep = 10^3)
+```
+
+
+## 2.8 Residual diagnostics for m.tid
+```{r}
+diag_tid <- df_long %>%
+  mutate(
+    fitted = fitted(m.tid),
+    resid  = residuals(m.tid, type = "deviance")
+  )
+
+p_tid_qq <- plot_qq(diag_tid, "model(1): QQ plot")
+p_tid_rf <- plot_resid_fitted(diag_tid, "model(1): Residuals vs fitted")
+p_tid_sl <- plot_scale_location(diag_tid, "model(1): Scale-location")
+acf_tid  <- plot_lag1_acf_hist(diag_tid, "model(1): Lag-1 residual ACF")
+
+p_all <- p_tid_qq | p_tid_rf | p_tid_sl | acf_tid$plot
+ggsave(
+  filename = "Shoulder_abd_R_model1_diagnostics.svg",
+  plot = p_all,
+  width = 20,
+  height = 5,
+  device = svglite::svglite
+)
+
+median(acf_tid$rho_df$rho1, na.rm = TRUE)
+```
+
+
+## 2.9 Concurvity and VIF for m.tid
+```{r}
+# Concurvity
+extract_concurvity <- function(model, model_name) {
+  cc <- concurvity(model, full = TRUE)
+  cc_df <- as.data.frame(t(cc))
+  cc_df$term <- rownames(cc_df)
+  rownames(cc_df) <- NULL
+  cc_df$model <- model_name
+
+  cc_df %>%
+    select(model, term, worst, observed, estimate)
+}
+
+concurvity_tid <- extract_concurvity(m.tid, "m.tid")
+concurvity_tid
+
+# VIF for parametric part only
+vif_tid <- get_parametric_vif(m.tid, df_long)
+vif_tid
+```
+
+
+
+# 3. GAM model with factor smooth
+## 3.1 GAM model with factor smooths
+```{r}
+m.fs <- gam(Error 
+         ~ 1                                       # Parametric intercept
+         + Device                                  # Parametric main effect of Group
+         + s(Angle_scale, by=Device)               # Smooth for angle scale (separately for each Device)
+         + s(Angle_scale, Participant, bs="fs")    # Factor smooths
+         + s(TrialID, bs="re"),                    # By-trialID random intercepts
+         data = df_long,
+         method = "REML",
+)
+```
+
+
+```{r}
+summary(m.fs)
+```
+
+
+## 3.2 Model prediction
+```{r}
+ggemmeans(m.fs, c("Angle_scale [all]", "Device")) |>
+  plot() +
+  scale_color_manual(values = c("Kinect_error" = "red", "Captiv_error" = "blue")) +
+  scale_fill_manual(values = c("Kinect_error" = "red", "Captiv_error" = "blue"))
+```
+
+
+## 3.3 Model summary of factor smooths approach
+```{r}
+## ----gam-both-sum-par---------------------------
+summary(m.fs)$p.table
+
+
+## ----gam-both-sum-smo---------------------------
+summary(m.fs)$s.table
+```
+
+
+## 3.4 k check
+```{r}
+k.check(m.fs, n.rep = 10^3)
+```
+### Interpretation: p value is not significant, indicating that k is sufficient.
+
+
+## 3.5 Compare factor smooth model and previous model
+```{r}
+compareML(m.tid, m.fs)
+```
+### Interpretation: AIC for m.fs is lower, indicating that model with factor smooth is a better model.
+
+
+## 3.6 Residual diagnostics for m.fs
+```{r}
+diag_fs <- df_long %>%
+  mutate(
+    fitted = fitted(m.fs),
+    resid  = residuals(m.fs, type = "deviance")
+  )
+
+p_fs_qq <- plot_qq(diag_fs, "model(2): QQ plot")
+p_fs_rf <- plot_resid_fitted(diag_fs, "model(2): Residuals vs fitted")
+p_fs_sl <- plot_scale_location(diag_fs, "model(2): Scale-location")
+acf_fs  <- plot_lag1_acf_hist(diag_fs, "model(2): Lag-1 residual ACF")
+
+p_all <- p_fs_qq | p_fs_rf | p_fs_sl | acf_fs$plot
+ggsave(
+  filename = "Shoulder_abd_R_model2_diagnostics.svg",
+  plot = p_all,
+  width = 20,
+  height = 5,
+  device = svglite::svglite
+)
+
+median(acf_fs$rho_df$rho1, na.rm = TRUE)
+```
+
+
+## 3.7 Concurvity and VIF for m.fs
+```{r}
+# Concurvity
+
+concurvity_fs <- extract_concurvity(m.fs, "m.fs")
+concurvity_fs
+
+# VIF for parametric part only
+vif_fs <- get_parametric_vif(m.fs, df_long)
+vif_fs
+```
+
+
+
+# 4. Consider auto-correlation in the GAM model
+## 4.1 Define nested trial and the AR-start flag
+```{r}
+df_long %>%
+  select(Participant, Trial, Device, TrialID, SeriesID, Frame, t) %>%
+  arrange(SeriesID, Frame) %>%
+  head(20)
+```
+
+
+## 4.2 Visualize the residuals to see whether thers is auto-correlation
+```{r}
+# residuals from factor-smooth model without AR(1)
+df_long$resid_fs <- residuals(m.fs, type = "deviance")
+
+rho_df <- df_long %>%
+  group_by(SeriesID) %>%
+  summarise(rho1 = acf1(resid_fs), .groups = "drop")
+
+ggplot(rho_df, aes(x = rho1)) +
+  geom_histogram(binwidth = 0.05) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  labs(title = "m.fs: Lag-1 ACF of residuals", x = "rho1", y = "Count")
+
+median(rho_df$rho1, na.rm = TRUE)
+```
+### Interpretation: the histogram is not centered around 0, most values are larger than 0.5, thus auto-correlation is likely existed.
+
+
+## 4.3 Fit AR(1) into GAM
+```{r}
+m.gamm_AR1 <- gamm(
+  Error ~ 
+    Device 
+  + s(Angle_scale, by = Device) 
+  + s(Angle_scale, Participant, bs = "fs"),
+  random = list(TrialID = ~ 1),
+  correlation = corAR1(form = ~ t | SeriesID),   # AR(1) within Trial×Device
+  data   = df_long,
+  method = "REML"
+)
+```
+
+
+## 4.4 Model prediction
+```{r}
+pdat <- ggpredict(
+  m.gamm_AR1$gam,
+  terms   = c("Angle_scale [all]", "Device"),
+  exclude = c("s(Angle_scale,Participant)", "s(TrialID)")  # key line
+)
+
+p <- plot(pdat) +
+  labs(
+    x = "Angle scale benchmark value",                 
+    y = "Predicted measurement difference",          
+    title = "Right shoulder abduction/adduction" 
+  ) +
+  scale_color_manual(
+    name   = "Device",   
+    values = c(Kinect_error = "red", Captiv_error = "blue"),
+    labels = c("Azure Kinect", "Captiv") 
+  ) +
+  scale_fill_manual(
+    name   = "Device",
+    values = c(Kinect_error = "red", Captiv_error = "blue"),
+    labels = c("Azure Kinect", "Captiv")
+  ) +
+  scale_x_continuous(breaks = seq(0, 150, by = 10), limits = c(0,150)) + 
+  scale_y_continuous(breaks = seq(-50, 30, by = 10), limits = c(-50,30)) + 
+  coord_fixed(ratio = 1)
+
+p <- p + theme(
+  plot.margin = unit(c(0.2, 0.2, 0.2, 0.2), "cm") 
+)
+
+print(p)
+
+ggsave(filename = "Shoulder_abd_R_model3_prediction.svg", plot = p, width = 8, height = 6, device = svglite::svglite)
+
+```
+
+
+## 4.5 Model summary
+```{r}
+## ----gam-both-sum-par---------------------------
+summary(m.gamm_AR1$gam)$p.table
+
+
+## ----gam-both-sum-smo---------------------------
+summary(m.gamm_AR1$gam)$s.table
+
+## AR(1)
+summary(m.gamm_AR1$lme)  
+```
+
+
+## 4.6 Residual diagnostics for m.gamm_AR1
+```{r}
+diag_ar1 <- df_long %>%
+  mutate(
+    fitted = fitted(m.gamm_AR1$lme),
+    resid  = resid(m.gamm_AR1$lme, type = "normalized")
+  )
+
+p_ar1_qq <- plot_qq(diag_ar1, "model(3): QQ plot")
+p_ar1_rf <- plot_resid_fitted(diag_ar1, "model(3): Residuals vs fitted")
+p_ar1_sl <- plot_scale_location(diag_ar1, "model(3): Scale-location")
+acf_ar1  <- plot_lag1_acf_hist(diag_ar1, "model(3): Lag-1 residual ACF")
+
+p_all <- p_ar1_qq | p_ar1_rf | p_ar1_sl | acf_ar1$plot
+ggsave(
+  filename = "Shoulder_abd_R_model3_diagnostics.svg",
+  plot = p_all,
+  width = 20,
+  height = 5,
+  device = svglite::svglite
+)
+
+median(acf_ar1$rho_df$rho1, na.rm = TRUE)
+```
+
+
+## 4.7 Model comparison
+```{r}
+m.gamm_noAR <- gamm(
+  Error ~ Device + s(Angle_scale, by = Device) + s(Angle_scale, Participant, bs = "fs"),
+  random = list(TrialID = ~ 1),
+  data   = df_long, method = "REML"
+)
+
+m.gamm_AR1 <- gamm(
+  Error ~ Device + s(Angle_scale, by = Device) + s(Angle_scale, Participant, bs = "fs"),
+  random = list(TrialID = ~ 1),
+  correlation = corAR1(form = ~ t | SeriesID),
+  data   = df_long, method = "REML"
+)
+
+## Model comparison
+anova(m.gamm_noAR$lme, m.gamm_AR1$lme)  
+AIC(m.gamm_noAR$lme, m.gamm_AR1$lme)
+```
+### Interpretation: factor smooths with AR(1) term is the best model so far.
+
+
+## 4.8 Diagnostic summary table
+```{r}
+diag_summary <- bind_rows(
+  acf_tid$rho_df %>%
+    summarise(Model = "m.tid",
+              median_rho1 = median(rho1, na.rm = TRUE),
+              mean_rho1   = mean(rho1, na.rm = TRUE)),
+  acf_fs$rho_df %>%
+    summarise(Model = "m.fs",
+              median_rho1 = median(rho1, na.rm = TRUE),
+              mean_rho1   = mean(rho1, na.rm = TRUE)),
+  acf_ar1$rho_df %>%
+    summarise(Model = "m.gamm_AR1",
+              median_rho1 = median(rho1, na.rm = TRUE),
+              mean_rho1   = mean(rho1, na.rm = TRUE))
+)
+
+diag_summary
+```
+
+
+# 5. Bland-Altman analysis
+## 5.1 Prepare raw BA dataset
+```{r}
+ba_raw <- bind_rows(
+  df %>%
+    transmute(
+      Participant,
+      Trial,
+      Device = "Azure Kinect",
+      Mean = (Kinect + Angle_scale) / 2,
+      Diff = Kinect - Angle_scale
+    ),
+  df %>%
+    transmute(
+      Participant,
+      Trial,
+      Device = "Captiv",
+      Mean = (Captiv + Angle_scale) / 2,
+      Diff = Captiv - Angle_scale
+    )
+) %>%
+  filter(!is.na(Mean), !is.na(Diff))
+
+head(ba_raw)
+```
+
+
+## 5.2 Compute Bland-Altman bias and limits of agreement
+```{r}
+ba_limits <- ba_raw %>%
+  group_by(Device) %>%
+  summarise(
+    n = n(),
+    Bias = mean(Diff, na.rm = TRUE),
+    SD_diff = sd(Diff, na.rm = TRUE),
+    LoA_lower = Bias - 1.96 * SD_diff,
+    LoA_upper = Bias + 1.96 * SD_diff,
+    .groups = "drop"
+  )
+
+ba_limits
+```
+
+
+## 5.3 Bland-Altman plot
+```{r}
+p_ba <- ggplot(ba_raw, aes(x = Mean, y = Diff)) +
+  geom_point(alpha = 0.20, size = 0.8) +
+  facet_wrap(~ Device, ncol = 2) +
+  geom_hline(
+    data = ba_limits,
+    aes(yintercept = Bias),
+    linetype = "solid",
+    inherit.aes = FALSE
+  ) +
+  geom_hline(
+    data = ba_limits,
+    aes(yintercept = LoA_lower),
+    linetype = "dashed",
+    inherit.aes = FALSE
+  ) +
+  geom_hline(
+    data = ba_limits,
+    aes(yintercept = LoA_upper),
+    linetype = "dashed",
+    inherit.aes = FALSE
+  ) +
+  theme_bw() +
+  labs(
+    title = "Bland-Altman plots",
+    x = "Mean of device and angle scale benchmark [°]",
+    y = "Difference (device - angle scale benchmark) [°]"
+  )
+
+print(p_ba)
+ggsave("Shoulder_abd_R_Bland_Altman_raw.svg", p_ba, width = 13, height = 5)
+```
