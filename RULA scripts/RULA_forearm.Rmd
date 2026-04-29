@@ -1,0 +1,176 @@
+---
+title: "Forearm movement_RULA"
+---
+
+```{r}
+# Set up workspace
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+set.seed(42)
+```
+
+
+## load library
+```{r cars}
+library(readxl)
+library(dplyr)
+library(Metrics)
+library(stats)
+library(ggplot2)
+library(blandr)
+library(openxlsx)
+```
+
+
+## Load data for elbow flexion
+Load excel sheet
+```{r pressure, echo=FALSE}
+df <- read_excel("D:/next.Hessenbox/Human-technology interaction/Motion tracking accuracy comparison/Data_Zenodo/Elbow_flexion_L+R.xlsx")
+```
+
+
+## Calculate elbow flexion
+```{r}
+classify_custom <- function(x) {
+  ifelse(x >= 60 & x < 100, "1", "2")
+}
+
+df <- df %>%
+  mutate(
+    Kinect_level = classify_custom(Kinect),
+    Captiv_level = classify_custom(Captiv),
+    Angle_level  = classify_custom(Angle_scale)
+  )
+
+calc_distribution <- function(level_col) {
+  total <- length(level_col)
+  tab <- table(level_col)
+  perc <- round(100 * tab / total, 2)
+  data.frame(
+    Value = names(tab),
+    Count = as.vector(tab),
+    Percentage = as.vector(perc)
+  )
+}
+
+kinect_dist <- calc_distribution(df$Kinect_level)
+captiv_dist <- calc_distribution(df$Captiv_level)
+angle_dist  <- calc_distribution(df$Angle_level)
+
+print(kinect_dist)
+print(captiv_dist)
+print(angle_dist)
+```
+
+
+## Binary RULA classification: low risk vs medium-high risk
+## Lower risk = Level 1
+## Higher risk = Level 2
+```{r}
+df <- df %>%
+  mutate(
+    Angle_risk_binary  = ifelse(Angle_level == 2, "Higher risk", "Lower risk"),
+    Kinect_risk_binary = ifelse(Kinect_level == 2, "Higher risk", "Lower risk"),
+    Captiv_risk_binary = ifelse(Captiv_level == 2, "Higher risk", "Lower risk")
+  )
+
+df <- df %>%
+  mutate(
+    Angle_risk_binary  = factor(Angle_risk_binary, levels = c("Higher risk", "Lower risk")),
+    Kinect_risk_binary = factor(Kinect_risk_binary, levels = c("Higher risk", "Lower risk")),
+    Captiv_risk_binary = factor(Captiv_risk_binary, levels = c("Higher risk", "Lower risk"))
+  )
+
+## Kinect vs angle-scale benchmark
+tab_kinect <- table(
+  Benchmark = df$Angle_risk_binary,
+  Kinect = df$Kinect_risk_binary
+)
+
+print(tab_kinect)
+
+mcnemar_kinect <- mcnemar.test(tab_kinect, correct = TRUE)
+print(mcnemar_kinect)
+
+b_kinect <- tab_kinect["Higher risk", "Lower risk"]
+c_kinect <- tab_kinect["Lower risk", "Higher risk"]
+
+exact_mcnemar_kinect <- binom.test(
+  x = b_kinect,
+  n = b_kinect + c_kinect,
+  p = 0.5,
+  alternative = "two.sided"
+)
+
+print(exact_mcnemar_kinect)
+
+## Captiv vs angle-scale benchmark
+tab_captiv <- table(
+  Benchmark = df$Angle_risk_binary,
+  Captiv = df$Captiv_risk_binary
+)
+
+print(tab_captiv)
+
+mcnemar_captiv <- mcnemar.test(tab_captiv, correct = TRUE)
+print(mcnemar_captiv)
+
+b_captiv <- tab_captiv["Higher risk", "Lower risk"]
+c_captiv <- tab_captiv["Lower risk", "Higher risk"]
+
+exact_mcnemar_captiv <- binom.test(
+  x = b_captiv,
+  n = b_captiv + c_captiv,
+  p = 0.5,
+  alternative = "two.sided"
+)
+
+print(exact_mcnemar_captiv)
+```
+
+
+## Summary table for binary RULA risk classification
+```{r}
+calc_binary_risk_summary <- function(tab, device_name) {
+  
+  TP <- tab["Higher risk", "Higher risk"]
+  FN <- tab["Higher risk", "Lower risk"]
+  FP <- tab["Lower risk", "Higher risk"]
+  TN <- tab["Lower risk", "Lower risk"]
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  false_negative_rate <- FN / (TP + FN)
+  false_positive_rate <- FP / (TN + FP)
+  accuracy <- (TP + TN) / (TP + FN + FP + TN)
+  
+  exact_test <- binom.test(
+    x = FN,
+    n = FN + FP,
+    p = 0.5,
+    alternative = "two.sided"
+  )
+  
+  data.frame(
+    Device = device_name,
+    True_positive = TP,
+    False_negative = FN,
+    False_positive = FP,
+    True_negative = TN,
+    Accuracy = round(accuracy, 3),
+    Sensitivity = round(sensitivity, 3),
+    Specificity = round(specificity, 3),
+    False_negative_rate = round(false_negative_rate, 3),
+    False_positive_rate = round(false_positive_rate, 3),
+    Underestimation_among_discordant = round(FN / (FN + FP), 3),
+    Exact_McNemar_p = round(exact_test$p.value, 4)
+  )
+}
+
+summary_kinect <- calc_binary_risk_summary(tab_kinect, "Azure Kinect")
+summary_captiv <- calc_binary_risk_summary(tab_captiv, "Captiv")
+
+binary_risk_summary <- bind_rows(summary_kinect, summary_captiv)
+
+print(binary_risk_summary)
+```
